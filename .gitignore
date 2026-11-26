@@ -1,0 +1,5 @@
+node_modules/
+.context/
+*.log
+.DS_Store
+__marimo__/
