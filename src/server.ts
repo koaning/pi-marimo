@@ -17,6 +17,8 @@ import {
 	marimoArgs,
 	parseExecuteResult,
 	parseNotebookList,
+	parseServerUrl,
+	sandboxEnabled,
 	withToken,
 } from "./marimo.ts";
 
@@ -123,7 +125,14 @@ export function startServer(path: string): OwnedServer {
 	mkdirSync(TOKEN_DIR, { recursive: true, mode: 0o700 });
 	writeFileSync(tokenFile(abs), token, { mode: 0o600 });
 	const fd = openSync(logPath, "a");
-	const args = marimoArgs("edit", abs, "--sandbox", "--skip-update-check", "--token-password-file", tokenFile(abs));
+	const args = marimoArgs(
+		"edit",
+		abs,
+		...(sandboxEnabled() ? ["--sandbox"] : []),
+		"--skip-update-check",
+		"--token-password-file",
+		tokenFile(abs),
+	);
 	const child = spawn(MARIMO_COMMAND, args, {
 		cwd: join(abs, ".."),
 		stdio: ["ignore", fd, fd],
@@ -150,16 +159,37 @@ export function logTail(server: OwnedServer, lines = 20): string {
 	}
 }
 
+/** The login URL the server printed, once it has printed it. */
+export function serverUrl(server: OwnedServer): string | undefined {
+	try {
+		return parseServerUrl(readFileSync(server.logPath, "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+function killServer(server: OwnedServer): void {
+	try {
+		process.kill(-server.pid, "SIGTERM");
+	} catch {
+		// already gone
+	}
+	removeTokenFile(server.path, server.token);
+}
+
+/** Stop the server this pi process started for `path`. Returns false if pi did not start one. */
+export function stopServer(path: string): boolean {
+	const abs = canonicalPath(path);
+	const server = registry().get(abs);
+	if (!server) return false;
+	killServer(server);
+	registry().delete(abs);
+	return true;
+}
+
 /** Stop every server this pi process started. Idempotent. */
 export function stopOwnedServers(): void {
-	for (const server of registry().values()) {
-		try {
-			process.kill(-server.pid, "SIGTERM");
-		} catch {
-			// already gone
-		}
-		removeTokenFile(server.path, server.token);
-	}
+	for (const server of registry().values()) killServer(server);
 	registry().clear();
 }
 
@@ -184,17 +214,23 @@ export async function openNotebook(path: string, options: OpenOptions = {}): Pro
 	options.onProgress?.(`Starting marimo for ${basename(abs)} — it will open in your browser…`);
 
 	const deadline = Date.now() + (options.timeoutMs ?? 120_000);
+	let url: string | undefined;
 	while (Date.now() < deadline) {
 		if (options.signal?.aborted) throw new Error("Aborted while waiting for marimo");
 		if (server.exited) {
 			throw new Error(`marimo exited before the notebook opened. Log (${server.logPath}):\n${logTail(server)}`);
 		}
+		// Show the login URL as soon as marimo prints it, for when no browser opens (SSH, containers).
+		if (!url && (url = serverUrl(server))) {
+			options.onProgress?.(`Waiting for ${basename(abs)} to open in your browser. If it didn't, open ${url}`);
+		}
 		const found = findNotebookByPath(await listNotebooks({ signal: options.signal }), abs);
 		if (found) return { notebook: found, started: true };
 		await sleep(1000);
 	}
+	const visit = url ? ` Open ${url} in a browser, then try again.` : "";
 	throw new Error(
-		`Timed out waiting for ${basename(abs)} to open. marimo only becomes pairable once the notebook is open in a browser. Log (${server.logPath}):\n${logTail(server)}`,
+		`Timed out waiting for ${basename(abs)} to open. marimo only becomes pairable once the notebook is open in a browser.${visit} Log (${server.logPath}):\n${logTail(server)}`,
 	);
 }
 

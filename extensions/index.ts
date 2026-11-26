@@ -1,6 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { basename } from "node:path";
+import { readdirSync } from "node:fs";
+import { basename, resolve } from "node:path";
 import { type Notebook, formatExecuteResult, promptSection } from "../src/marimo.ts";
 import {
 	browserUrl,
@@ -10,6 +12,7 @@ import {
 	openNotebook,
 	seedNotebook,
 	stopOwnedServers,
+	stopServer,
 } from "../src/server.ts";
 import { attach, openViaHost } from "../src/attach.ts";
 import { showMascotHeader } from "./mascot.ts";
@@ -19,8 +22,38 @@ const STATUS_ID = "pi-marimo";
 
 const text = (value: string) => [{ type: "text" as const, text: value }];
 
+/** How pi's link to the paired notebook looks right now. */
+type Link = "connecting" | "connected" | "lost" | "not running";
+
+const SUBCOMMANDS: AutocompleteItem[] = [
+	{ value: "open", label: "open", description: "Reopen the paired notebook in the browser (restarts it if it stopped)" },
+	{ value: "list", label: "list", description: "Pick a running notebook to pair with" },
+	{ value: "disconnect", label: "disconnect", description: "Unpair pi from the notebook" },
+	{ value: "stop", label: "stop", description: "Stop the marimo server pi started, and unpair" },
+];
+
+/** `.py` files and directories under the typed path, for `/marimo <file.py>`. */
+function pathCompletions(prefix: string): AutocompleteItem[] {
+	const dir = prefix.slice(0, prefix.lastIndexOf("/") + 1);
+	const base = prefix.slice(dir.length);
+	try {
+		return readdirSync(resolve(process.cwd(), dir || "."), { withFileTypes: true })
+			.filter((e) => !e.name.startsWith(".") && e.name.startsWith(base) && (e.isDirectory() || e.name.endsWith(".py")))
+			.slice(0, 50)
+			.map((e) => {
+				const value = `${dir}${e.name}${e.isDirectory() ? "/" : ""}`;
+				return { value, label: value };
+			});
+	} catch {
+		return [];
+	}
+}
+
+const notebookLabel = (n: Notebook) => `${n.path} (${n.url})`;
+
 export default function (pi: ExtensionAPI) {
 	let paired: Notebook | undefined;
+	let link: Link = "connecting";
 	let state = "no notebook paired";
 	/** Pairing started by --marimo; agent runs and tools wait for it. */
 	let pending: Promise<void> | undefined;
@@ -28,7 +61,6 @@ export default function (pi: ExtensionAPI) {
 	let currentCtx: ExtensionContext | undefined;
 	/** Event stream that makes marimo show the "pi connected" pill. */
 	let attachment: { stop: () => void } | undefined;
-	let connected = false;
 
 	function setState(next: string) {
 		state = next;
@@ -38,22 +70,31 @@ export default function (pi: ExtensionAPI) {
 
 	function pairedState() {
 		if (!paired) return "no notebook paired";
-		return `${basename(paired.path)} · ${paired.url}${connected ? " · connected" : ""}`;
+		const suffix = link === "connecting" ? "" : ` · ${link}`;
+		return `${basename(paired.path)} · ${paired.url}${suffix}`;
+	}
+
+	function setLink(next: Link) {
+		link = next;
+		setState(pairedState());
 	}
 
 	function connectPill(notebook: Notebook) {
 		attachment?.stop();
-		connected = false;
+		link = "connecting";
 		attachment = attach(notebook, {
 			name: "pi",
 			identity: `pi:${process.pid}`,
-			onAttached: () => {
-				connected = true;
-				setState(pairedState());
+			onAttached: () => setLink("connected"),
+			onDropped: () => {
+				setLink("lost");
+				currentCtx?.ui.notify(
+					`pi-marimo: lost the connection to ${basename(notebook.path)}. If marimo stopped, \`/marimo open\` restarts it.`,
+					"warning",
+				);
 			},
 			onDetachedByUser: () => {
 				attachment = undefined;
-				connected = false;
 				paired = undefined;
 				pi.appendEntry(ENTRY_TYPE, { notebook: null });
 				setState("disconnected from marimo");
@@ -69,6 +110,19 @@ export default function (pi: ExtensionAPI) {
 		setState(pairedState());
 	}
 
+	/** Forget the paired notebook. The pill disappears once the event stream closes. */
+	function unpair(message = "no notebook paired") {
+		attachment?.stop();
+		attachment = undefined;
+		paired = undefined;
+		pi.appendEntry(ENTRY_TYPE, { notebook: null });
+		setState(message);
+	}
+
+	async function isRunning(notebook: Notebook, signal?: AbortSignal): Promise<boolean> {
+		return (await listNotebooks({ signal })).some((n) => n.id === notebook.id);
+	}
+
 	async function open(path: string, signal?: AbortSignal, onProgress?: (message: string) => void) {
 		setState(`opening ${basename(path)}…`);
 		try {
@@ -81,11 +135,7 @@ export default function (pi: ExtensionAPI) {
 			});
 			// A freshly started server opens the browser itself; a reused one doesn't,
 			// so open it here unless this session is already paired with it.
-			if (!started && paired?.id !== notebook.id) {
-				void openViaHost(notebook).then((url) => {
-					if (!url) openBrowser(browserUrl(notebook));
-				});
-			}
+			if (!started && paired?.id !== notebook.id) reopenBrowser(notebook);
 			pair(notebook);
 			const seeded = await seedNotebook(notebook.id, { signal }).catch((error: Error) => {
 				currentCtx?.ui.notify(`pi-marimo: ${error.message}`, "warning");
@@ -96,6 +146,12 @@ export default function (pi: ExtensionAPI) {
 			setState(pairedState());
 			throw error;
 		}
+	}
+
+	function reopenBrowser(notebook: Notebook) {
+		void openViaHost(notebook).then((url) => {
+			if (!url) openBrowser(browserUrl(notebook));
+		});
 	}
 
 	pi.registerFlag("marimo", {
@@ -113,12 +169,18 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		if (paired) {
-			setState(pairedState());
+			setLink("connecting");
 			// Resumed or reloaded session: reconnect the pill if the notebook is still running.
 			const restored = paired;
-			void listNotebooks()
-				.then((notebooks) => {
-					if (paired === restored && notebooks.some((n) => n.id === restored.id)) connectPill(restored);
+			void isRunning(restored)
+				.then((running) => {
+					if (paired !== restored) return;
+					if (running) {
+						connectPill(restored);
+					} else {
+						setLink("not running");
+						ctx.ui.notify(`pi-marimo: ${basename(restored.path)} is no longer running. \`/marimo open\` restarts it.`, "warning");
+					}
 				})
 				.catch(() => {});
 		}
@@ -223,24 +285,99 @@ export default function (pi: ExtensionAPI) {
 			if (!target) throw new Error("No marimo notebook is paired. Use marimo_start or marimo_connect first.");
 			const result = await executeInNotebook(target, params.code, { signal });
 			const output = formatExecuteResult(result);
-			if (!result.success) throw new Error(output);
+			if (!result.success) {
+				// When pi's link to the paired notebook isn't healthy, say whether the notebook is gone
+				// rather than passing on the CLI's error. (Skipped while connected: most failures are Python errors.)
+				const notebook = paired?.id === target ? paired : undefined;
+				if (notebook && link !== "connected" && !(await isRunning(notebook, signal).catch(() => true))) {
+					setLink("not running");
+					throw new Error(
+						`The paired notebook ${notebook.path} is not running any more. Call marimo_start with that path to restart it, or ask the user to run \`/marimo open\`.`,
+					);
+				}
+				throw new Error(output);
+			}
 			return { content: text(output), details: { result } };
 		},
 	});
 
 	pi.registerCommand("marimo", {
-		description: "Show the paired marimo notebook, or `/marimo <file.py>` to open and pair with one",
+		description: "Paired marimo notebook: `/marimo <file.py>` to open one, or open | list | disconnect | stop",
+		getArgumentCompletions: (prefix) => {
+			const items = [...SUBCOMMANDS.filter((s) => s.value.startsWith(prefix)), ...pathCompletions(prefix)];
+			return items.length ? items : null;
+		},
 		handler: async (args, ctx) => {
-			const path = args.trim();
-			if (!path) {
-				ctx.ui.notify(paired ? `Paired with ${paired.path} (${paired.url})` : "No marimo notebook paired.", "info");
+			const arg = args.trim();
+			const notify = (message: string, type: "info" | "warning" | "error" = "info") => ctx.ui.notify(message, type);
+			const fail = (error: unknown) => notify(`pi-marimo: ${(error as Error).message}`, "error");
+
+			if (!arg) {
+				notify(
+					paired
+						? `Paired with ${notebookLabel(paired)}${link === "connecting" ? "" : ` · ${link}`}. Try /marimo open | list | disconnect | stop.`
+						: "No marimo notebook paired. Use /marimo <file.py> or /marimo list.",
+				);
 				return;
 			}
+
+			if (arg === "open") {
+				if (!paired) return notify("No marimo notebook paired. Use /marimo <file.py>.", "warning");
+				try {
+					if (await isRunning(paired)) {
+						reopenBrowser(paired);
+						notify(`Opening ${notebookLabel(paired)}`);
+					} else {
+						const { notebook } = await open(paired.path);
+						notify(`Restarted and paired with ${notebookLabel(notebook)}`);
+					}
+				} catch (error) {
+					fail(error);
+				}
+				return;
+			}
+
+			if (arg === "list") {
+				try {
+					const notebooks = await listNotebooks();
+					if (!notebooks.length) return notify("No running marimo notebooks. Use /marimo <file.py> to start one.");
+					if (!ctx.hasUI) return notify(notebooks.map((n) => `${n.id}  ${notebookLabel(n)}`).join("\n"));
+					const labels = notebooks.map((n) => `${paired?.id === n.id ? "● " : ""}${notebookLabel(n)}`);
+					const choice = await ctx.ui.select("Pair with a running marimo notebook", labels);
+					const notebook = choice === undefined ? undefined : notebooks[labels.indexOf(choice)];
+					if (!notebook || notebook.id === paired?.id) return;
+					pair(notebook);
+					notify(`Paired with ${notebookLabel(notebook)}`);
+				} catch (error) {
+					fail(error);
+				}
+				return;
+			}
+
+			if (arg === "disconnect") {
+				if (!paired) return notify("No marimo notebook paired.");
+				const path = paired.path;
+				unpair();
+				notify(`Unpaired from ${basename(path)}. The notebook keeps running.`);
+				return;
+			}
+
+			if (arg === "stop") {
+				if (!paired) return notify("No marimo notebook paired.");
+				const path = paired.path;
+				if (!stopServer(path)) {
+					return notify(`pi didn't start the server for ${basename(path)}; stop it where it runs, or use /marimo disconnect.`, "warning");
+				}
+				unpair(`stopped ${basename(path)}`);
+				notify(`Stopped marimo for ${basename(path)}.`);
+				return;
+			}
+
 			try {
-				const { notebook } = await open(path);
-				ctx.ui.notify(`Paired with ${notebook.path} (${notebook.url})`, "info");
+				const { notebook } = await open(arg);
+				notify(`Paired with ${notebookLabel(notebook)}`);
 			} catch (error) {
-				ctx.ui.notify(`pi-marimo: ${(error as Error).message}`, "error");
+				fail(error);
 			}
 		},
 	});
