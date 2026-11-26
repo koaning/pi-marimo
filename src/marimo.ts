@@ -109,12 +109,32 @@ export function promptSection(notebook: Notebook | undefined): string {
 		'- Install packages with ctx.packages.add("pkg"), never pip or uv add, and confirm first if the user did not ask for it.',
 		"- Never edit the notebook .py file directly while it is open; code mode is the only write path.",
 		"- For more guidance run `uvx marimo@latest pair docs <topic>` (topics: gotchas, notebook-improvements, rich-representations).",
+		"- Whenever you start or connect to a notebook, say in your text reply that it is running and give its full URL (as returned by the tool). The user may not see tool output, e.g. over ACP.",
 	];
 	if (notebook) {
 		lines.push("", `Paired notebook: ${notebook.path} (id ${notebook.id}, ${notebook.url}). marimo_execute targets it by default.`);
 	} else {
 		lines.push("", "No notebook is paired yet.");
 	}
+	return lines.join("\n");
+}
+
+/** Sentence asking the agent to repeat the URL in its reply, for clients that hide tool output. */
+export function tellUserNote(url: string): string {
+	return `Tell the user in your reply that the notebook is running at ${url}. Give the full URL in text, not only in a tool call: some clients (e.g. over ACP) don't show tool output.`;
+}
+
+/** Text `marimo_start` returns to the model. `url` is the full (login) URL. */
+export function startResultText(options: { notebook: Notebook; url: string; started: boolean; seeded: boolean }): string {
+	const { notebook, url, started, seeded } = options;
+	const lines = [
+		`${started ? "Started" : "Already running"}: ${notebook.path}`,
+		`notebook id: ${notebook.id}`,
+		`url: ${url}`,
+		"Paired; marimo_execute now targets it.",
+	];
+	if (seeded) lines.push("The notebook was empty, so its first cell now has `import marimo as mo` (already run).");
+	lines.push("", tellUserNote(url));
 	return lines.join("\n");
 }
 

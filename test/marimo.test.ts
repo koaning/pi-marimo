@@ -13,6 +13,7 @@ import {
 	parseServerUrl,
 	promptSection,
 	sandboxEnabled,
+	startResultText,
 	type Notebook,
 } from "../src/marimo.ts";
 
@@ -113,6 +114,29 @@ describe("promptSection", () => {
 
 	it("says when nothing is paired", () => {
 		expect(promptSection(undefined)).toContain("No notebook is paired yet.");
+	});
+
+	it("asks the agent to state the full URL in its reply", () => {
+		expect(promptSection(undefined)).toContain("give its full URL");
+	});
+});
+
+describe("startResultText", () => {
+	const nb: Notebook = { id: "nb-a", name: "a", path: "/work/a.py", url: "http://127.0.0.1:2718", status: "running" };
+	const url = "http://127.0.0.1:2718/?access_token=tok";
+
+	it("gives the full URL and asks the agent to repeat it", () => {
+		const out = startResultText({ notebook: nb, url, started: true, seeded: false });
+		expect(out).toContain(`url: ${url}`);
+		expect(out).toContain(`the notebook is running at ${url}`);
+		expect(out.startsWith("Started: /work/a.py")).toBe(true);
+		expect(out).not.toContain("import marimo as mo");
+	});
+
+	it("says when the notebook was already running, and when it was seeded", () => {
+		const out = startResultText({ notebook: nb, url, started: false, seeded: true });
+		expect(out.startsWith("Already running: /work/a.py")).toBe(true);
+		expect(out).toContain("import marimo as mo");
 	});
 });
 
