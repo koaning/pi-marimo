@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { SseParser, findHostToken, hostApiUrl } from "../src/attach.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { SseParser, attach, findHostToken, hostApiUrl } from "../src/attach.ts";
 
 describe("hostApiUrl", () => {
 	it("maps a notebook URL to marimo's host API", () => {
@@ -41,5 +41,54 @@ describe("SseParser", () => {
 
 	it("handles CRLF line endings", () => {
 		expect(new SseParser().push("event: x\r\ndata: y\r\n\r\n")).toEqual([{ event: "x", data: "y" }]);
+	});
+});
+
+describe("attach", () => {
+	const notebook = { id: "nb", name: "nb", path: "/work/nb.py", url: "http://127.0.0.1:2799", status: "running" };
+	const identity = "pi:test";
+
+	/** An event stream that confirms the attachment, then ends (as when marimo stops). */
+	function attachedThenClosed() {
+		const body = new ReadableStream<Uint8Array>({
+			start(c) {
+				const data = JSON.stringify({ attachment: { id: "att-1", identity } });
+				c.enqueue(new TextEncoder().encode(`event: attachment\ndata: ${data}\n\n`));
+				c.close();
+			},
+		});
+		return new Response(body, { status: 200 });
+	}
+
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it("reports drops and reconnects", async () => {
+		const events: string[] = [];
+		const fetchMock = vi.fn(async () => attachedThenClosed());
+		vi.stubGlobal("fetch", fetchMock);
+		const handle = attach(notebook, {
+			name: "pi",
+			identity,
+			retryDelayMs: 1,
+			onAttached: () => events.push("attached"),
+			onDropped: () => events.push("dropped"),
+		});
+		await vi.waitFor(() => expect(events.length).toBeGreaterThanOrEqual(3));
+		handle.stop();
+		expect(events.slice(0, 3)).toEqual(["attached", "dropped", "attached"]);
+	});
+
+	it("does not report a drop if it never attached", async () => {
+		const events: string[] = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("ECONNREFUSED");
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		const handle = attach(notebook, { name: "pi", identity, retryDelayMs: 1, onDropped: () => events.push("dropped") });
+		await vi.waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(3));
+		handle.stop();
+		expect(events).toEqual([]);
 	});
 });

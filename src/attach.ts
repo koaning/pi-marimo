@@ -114,10 +114,14 @@ export interface AttachOptions {
 	name: string;
 	/** Stable per pi process, so reconnects replace rather than add. */
 	identity: string;
-	/** Called once marimo confirms the attachment. */
+	/** Called when marimo confirms the attachment, and again after each reconnect. */
 	onAttached?: () => void;
+	/** Called when an established stream drops (e.g. marimo stopped). attach() keeps retrying. */
+	onDropped?: () => void;
 	/** Called when the user clicks Disconnect in marimo. The attachment stops. */
 	onDetachedByUser?: () => void;
+	/** First retry delay; doubles up to 15s. */
+	retryDelayMs?: number;
 }
 
 /** Keep pi attached to `notebook` until stop() is called. Reconnects if the stream drops. */
@@ -125,10 +129,12 @@ export function attach(notebook: Notebook, options: AttachOptions): { stop: () =
 	let stopped = false;
 	let controller: AbortController | undefined;
 	let attachmentId: string | undefined;
-	let announced = false;
+	/** True between marimo confirming the attachment and the stream dropping. */
+	let live = false;
+	const firstDelay = options.retryDelayMs ?? 1000;
 
 	const run = async () => {
-		let delay = 1000;
+		let delay = firstDelay;
 		while (!stopped) {
 			const apiUrl = hostApiUrl(notebook.url);
 			const token = findHostToken(readHostRecords(), apiUrl);
@@ -152,9 +158,9 @@ export function attach(notebook: Notebook, options: AttachOptions): { stop: () =
 							const a = (JSON.parse(ev.data) as { attachment?: { id?: string; identity?: string } }).attachment;
 							if (a?.identity === options.identity && a.id) {
 								attachmentId = a.id;
-								delay = 1000;
-								if (!announced) {
-									announced = true;
+								delay = firstDelay;
+								if (!live) {
+									live = true;
 									options.onAttached?.();
 								}
 							}
@@ -173,6 +179,10 @@ export function attach(notebook: Notebook, options: AttachOptions): { stop: () =
 				// stream dropped or server not reachable; retry below
 			}
 			if (stopped) return;
+			if (live) {
+				live = false;
+				options.onDropped?.();
+			}
 			await new Promise((r) => setTimeout(r, delay));
 			delay = Math.min(delay * 2, 15_000);
 		}

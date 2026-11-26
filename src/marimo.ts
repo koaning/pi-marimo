@@ -3,7 +3,7 @@
  * so it can be unit tested without marimo or pi.
  */
 import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 /** Every marimo invocation goes through `uvx marimo@latest`. */
 export const MARIMO_COMMAND = "uvx";
@@ -31,13 +31,21 @@ export function parseNotebookList(stdout: string): Notebook[] {
 	);
 }
 
-/** Resolve a path and follow symlinks when the file exists (macOS /tmp → /private/tmp). */
+/**
+ * Resolve a path and follow symlinks (macOS /tmp → /private/tmp). For a file that
+ * doesn't exist yet, resolve its directory instead, so the result stays the same
+ * once marimo creates the file.
+ */
 export function canonicalPath(path: string, cwd: string = process.cwd()): string {
 	const abs = resolve(cwd, path);
 	try {
 		return realpathSync(abs);
 	} catch {
-		return abs;
+		try {
+			return join(realpathSync(dirname(abs)), basename(abs));
+		} catch {
+			return abs;
+		}
 	}
 }
 
@@ -135,4 +143,17 @@ export function withToken(url: string, token: string): string {
 	const u = new URL(url);
 	u.searchParams.set("access_token", token);
 	return u.toString();
+}
+
+/** The login URL marimo prints at startup (`URL: http://localhost:2718?access_token=…`). */
+export function parseServerUrl(log: string): string | undefined {
+	// Strip ANSI escapes in case marimo colored its output.
+	const plain = log.replace(/\x1b\[[0-9;]*m/g, "");
+	return plain.match(/URL:\s*(https?:\/\/\S+)/)?.[1];
+}
+
+/** Whether to start notebooks with `--sandbox`. On unless PI_MARIMO_SANDBOX is 0/false/no/off. */
+export function sandboxEnabled(env: Record<string, string | undefined> = process.env): boolean {
+	const value = env.PI_MARIMO_SANDBOX?.trim().toLowerCase();
+	return !value || !["0", "false", "no", "off"].includes(value);
 }

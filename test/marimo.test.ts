@@ -3,13 +3,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+	canonicalPath,
 	findNotebookByPath,
 	formatExecuteResult,
 	withToken,
 	marimoArgs,
 	parseExecuteResult,
 	parseNotebookList,
+	parseServerUrl,
 	promptSection,
+	sandboxEnabled,
 	type Notebook,
 } from "../src/marimo.ts";
 
@@ -61,6 +64,15 @@ describe("findNotebookByPath", () => {
 		const nb: Notebook = { id: "nb-l", name: "real", path: real, url: "u", status: "running" };
 		expect(findNotebookByPath([nb], join(dir, "link.py"))?.id).toBe("nb-l");
 	});
+
+	it("gives a missing file the same path it will have once created", () => {
+		const real = mkdtempSync(join(tmpdir(), "pi-marimo-test-"));
+		const linked = `${real}-link`;
+		symlinkSync(real, linked);
+		const before = canonicalPath(join(linked, "new.py"));
+		writeFileSync(join(real, "new.py"), "");
+		expect(before).toBe(canonicalPath(join(linked, "new.py")));
+	});
 });
 
 describe("execute results", () => {
@@ -111,5 +123,31 @@ describe("withToken", () => {
 
 	it("replaces an existing token", () => {
 		expect(withToken("http://127.0.0.1:2724/?access_token=old", "new")).toBe("http://127.0.0.1:2724/?access_token=new");
+	});
+});
+
+describe("parseServerUrl", () => {
+	it("finds the login URL marimo prints at startup", () => {
+		const log = "\n        Edit nb.py in your browser 📝\n\n        ➜  URL: http://localhost:2725?access_token=tok123\n\n";
+		expect(parseServerUrl(log)).toBe("http://localhost:2725?access_token=tok123");
+	});
+
+	it("ignores ANSI colors", () => {
+		expect(parseServerUrl("\x1b[32mURL\x1b[0m: \x1b[1mhttp://localhost:2718\x1b[0m\n")).toBe("http://localhost:2718");
+	});
+
+	it("returns undefined before marimo printed it", () => {
+		expect(parseServerUrl("Installing packages…")).toBeUndefined();
+	});
+});
+
+describe("sandboxEnabled", () => {
+	it("is on by default", () => {
+		expect(sandboxEnabled({})).toBe(true);
+		expect(sandboxEnabled({ PI_MARIMO_SANDBOX: "1" })).toBe(true);
+	});
+
+	it("turns off with PI_MARIMO_SANDBOX=0/false/no/off", () => {
+		for (const value of ["0", "false", "No", " off "]) expect(sandboxEnabled({ PI_MARIMO_SANDBOX: value })).toBe(false);
 	});
 });
