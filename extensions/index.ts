@@ -3,7 +3,7 @@ import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { readdirSync } from "node:fs";
 import { basename, resolve } from "node:path";
-import { type Notebook, formatExecuteResult, promptSection } from "../src/marimo.ts";
+import { type Notebook, formatExecuteResult, promptSection, startResultText, tellUserNote } from "../src/marimo.ts";
 import {
 	browserUrl,
 	executeInNotebook,
@@ -232,6 +232,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Start or open a marimo notebook and pair with it",
 		promptGuidelines: [
 			"Use marimo_start when the user wants to create, open, or start a marimo notebook; do not run `marimo edit` through bash.",
+			"After marimo_start succeeds, always tell the user in plain text that the notebook is running, with its full URL.",
 		],
 		parameters: Type.Object({
 			path: Type.String({ description: "Notebook .py file, relative to the working directory" }),
@@ -241,11 +242,10 @@ export default function (pi: ExtensionAPI) {
 			const { notebook, started, seeded } = await open(params.path, signal, (message) =>
 				onUpdate?.({ content: text(message), details: undefined }),
 			);
-			const how = started ? "Started" : "Already running";
-			const seedNote = seeded ? "\nThe notebook was empty, so its first cell now has `import marimo as mo` (already run)." : "";
+			const url = browserUrl(notebook);
 			return {
-				content: text(`${how}: ${notebook.path}\nnotebook id: ${notebook.id}\nurl: ${notebook.url}\nPaired; marimo_execute now targets it.${seedNote}`),
-				details: { notebook, started, seeded },
+				content: text(startResultText({ notebook, url, started, seeded })),
+				details: { notebook, url, started, seeded },
 			};
 		},
 	});
@@ -262,7 +262,8 @@ export default function (pi: ExtensionAPI) {
 			const notebook = (await listNotebooks({ signal })).find((n) => n.id === params.notebook);
 			if (!notebook) throw new Error(`No running notebook with id ${params.notebook}. Use marimo_list.`);
 			pair(notebook);
-			return { content: text(`Paired with ${notebook.path} (${notebook.url}).`), details: { notebook } };
+			const url = browserUrl(notebook);
+			return { content: text(`Paired with ${notebook.path} (${url}).\n\n${tellUserNote(url)}`), details: { notebook, url } };
 		},
 	});
 
